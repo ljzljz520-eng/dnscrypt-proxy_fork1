@@ -1,6 +1,6 @@
 module github.com/dnscrypt/dnscrypt-proxy
 
-go 1.27
+go 1.27.0
 
 require (
 	codeberg.org/miekg/dns v0.6.109
@@ -26,9 +26,9 @@ require (
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/powerman/check v1.13.0
 	github.com/quic-go/quic-go v0.62.0
-	golang.org/x/crypto v0.56.0
-	golang.org/x/net v0.58.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
@@ -38,5 +38,5 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
