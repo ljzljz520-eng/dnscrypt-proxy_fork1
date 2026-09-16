@@ -22,6 +22,31 @@ const (
 	DefaultNetprobeAddress = "9.9.9.9:53"
 )
 
+// MDSSchedulerConfig holds the optional knobs of the "mds" load balancing
+// strategy, read from the [scheduler_mds] TOML section. Fields are
+// pointers so that an unset key keeps the built-in default (a zero value
+// such as a 0 weight is still a valid explicit setting). Out-of-range
+// values are rejected with a warning and replaced by the default.
+type MDSSchedulerConfig struct {
+	WarmupSamples           *uint64  `toml:"warmup_samples"`
+	PenaltyMinSamples       *uint64  `toml:"penalty_min_samples"`
+	SwitchMargin            *float64 `toml:"switch_margin"`
+	TieBand                 *float64 `toml:"tie_band"`
+	Dwell                   *string  `toml:"dwell"`
+	ExplorationProbability  *float64 `toml:"exploration_probability"`
+	CircuitBreakerThreshold *uint32  `toml:"circuit_breaker_threshold"`
+	HalfOpenInterval        *string  `toml:"half_open_interval"`
+	MetricsWindow           *string  `toml:"metrics_window"`
+	WeightTimeout           *float64 `toml:"weight_timeout"`
+	WeightErrors            *float64 `toml:"weight_errors"`
+	WeightServfail          *float64 `toml:"weight_servfail"`
+	WeightDNSSECBogus       *float64 `toml:"weight_dnssec_bogus"`
+	WeightTruncated         *float64 `toml:"weight_truncated"`
+	WeightFallback          *float64 `toml:"weight_fallback"`
+	WeightConnNew           *float64 `toml:"weight_conn_new"`
+	WeightJitter            *float64 `toml:"weight_jitter"`
+}
+
 type Config struct {
 	LogLevel                 int                `toml:"log_level"`
 	LogFile                  *string            `toml:"log_file"`
@@ -46,6 +71,7 @@ type Config struct {
 	EphemeralKeys            bool               `toml:"dnscrypt_ephemeral_keys"`
 	LBStrategy               string             `toml:"lb_strategy"`
 	LBEstimator              bool               `toml:"lb_estimator"`
+	SchedulerMDS             MDSSchedulerConfig `toml:"scheduler_mds"`
 	BlockIPv6                bool               `toml:"block_ipv6"`
 	BlockUnqualified         bool               `toml:"block_unqualified"`
 	BlockUndelegated         bool               `toml:"block_undelegated"`

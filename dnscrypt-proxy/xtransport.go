@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
@@ -79,9 +80,31 @@ type AltSupport struct {
 	cache map[string]AltSupportEntry
 }
 
+// FetchTrace describes how an HTTP fetch was actually served. It feeds the
+// multi-dimensional scheduler with fallback and connection-setup signals.
+type FetchTrace struct {
+	// UsedHTTP3 is true when the final response was served over HTTP/3.
+	UsedHTTP3 bool
+	// QUICFallback is true when HTTP/3 was attempted first and the request
+	// had to be retried over HTTP/2.
+	QUICFallback bool
+	// ConnReused is true when no new connection/session had to be
+	// established (pooled H2 connection, resumed TLS session, or a cached
+	// QUIC connection).
+	ConnReused bool
+	// TLSResumed is true when the TLS layer resumed a session.
+	TLSResumed bool
+	// NegotiatedProto is the ALPN protocol of the serving connection
+	// ("h2", "h3", "http/1.x").
+	NegotiatedProto string
+}
+
 type XTransport struct {
-	transport                *http.Transport
-	h3Transport              *http3.Transport
+	transport   *http.Transport
+	h3Transport *http3.Transport
+	// quicDialCount counts newly established QUIC connections per host so
+	// that a Fetch can tell whether HTTP/3 paid a connection-setup cost.
+	quicDialCount            sync.Map // map[string]*atomic.Uint64
 	keepAlive                time.Duration
 	timeout                  time.Duration
 	cachedIPs                CachedIPs
@@ -123,6 +146,21 @@ func NewXTransport() *XTransport {
 		keyLogWriter:             nil,
 	}
 	return &xTransport
+}
+
+// quicDials returns the number of QUIC connections established for a host.
+func (xTransport *XTransport) quicDials(host string) uint64 {
+	if v, ok := xTransport.quicDialCount.Load(host); ok {
+		return v.(*atomic.Uint64).Load()
+	}
+	return 0
+}
+
+// recordQUICDial atomically increments the established-connection counter of
+// a host.
+func (xTransport *XTransport) recordQUICDial(host string) {
+	v, _ := xTransport.quicDialCount.LoadOrStore(host, &atomic.Uint64{})
+	v.(*atomic.Uint64).Add(1)
 }
 
 // loadAltSupport reports the cached HTTP/3 state for a host. An expired
@@ -496,6 +534,7 @@ func (xTransport *XTransport) rebuildTransport() {
 					}
 					continue
 				}
+				xTransport.recordQUICDial(host)
 				return conn, nil
 			}
 			return nil, lastErr
@@ -717,10 +756,11 @@ func (xTransport *XTransport) Fetch(
 	body *[]byte,
 	timeout time.Duration,
 	compress bool,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	if timeout <= 0 {
 		timeout = xTransport.timeout
 	}
+	ft := &FetchTrace{}
 	client := http.Client{
 		Transport: xTransport.transport,
 		Timeout:   timeout,
@@ -765,14 +805,14 @@ func (xTransport *XTransport) Fetch(
 		url = &url2
 	}
 	if xTransport.proxyDialer == nil && strings.HasSuffix(host, ".onion") {
-		return nil, 0, nil, 0, errors.New("Onion service is not reachable without Tor")
+		return nil, 0, nil, 0, ft, errors.New("Onion service is not reachable without Tor")
 	}
 	if err := xTransport.resolveAndUpdateCache(host); err != nil {
 		dlog.Errorf(
 			"Unable to resolve [%v] - Make sure that the system resolver works, or that `bootstrap_resolvers` has been set to resolvers that can be reached",
 			host,
 		)
-		return nil, 0, nil, 0, err
+		return nil, 0, nil, 0, ft, err
 	}
 	if compress && body == nil {
 		header["Accept-Encoding"] = []string{"gzip"}
@@ -783,10 +823,20 @@ func (xTransport *XTransport) Fetch(
 		Header: header,
 		Close:  false,
 	}
+	// httptrace reveals whether the HTTP/2/H1 transport reused a pooled
+	// connection. This is the only reliable signal of H2 connection reuse.
+	var connReused bool
+	clientTrace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			connReused = info.Reused
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), clientTrace))
 	if body != nil {
 		req.ContentLength = int64(len(*body))
 		req.Body = io.NopCloser(bytes.NewReader(*body))
 	}
+	dialsBefore := xTransport.quicDials(host)
 	start := time.Now()
 	resp, err := client.Do(req)
 	rtt := time.Since(start)
@@ -808,6 +858,7 @@ func (xTransport *XTransport) Fetch(
 		}
 
 		// Retry with HTTP/2
+		ft.QUICFallback = true
 		client.Transport = xTransport.transport
 		if body != nil {
 			req.Body = io.NopCloser(bytes.NewReader(*body))
@@ -815,6 +866,16 @@ func (xTransport *XTransport) Fetch(
 		start = time.Now()
 		resp, err = client.Do(req)
 		rtt = time.Since(start)
+	}
+
+	// Populate the serving-transport trace. For HTTP/3 a fresh QUIC dial
+	// means a new connection was established; for HTTP/2/1 the httptrace
+	// GotConn info reports connection reuse.
+	ft.UsedHTTP3 = err == nil && client.Transport == xTransport.h3Transport
+	if ft.UsedHTTP3 {
+		ft.ConnReused = xTransport.quicDials(host) == dialsBefore
+	} else {
+		ft.ConnReused = connReused
 	}
 
 	if err == nil {
@@ -834,7 +895,7 @@ func (xTransport *XTransport) Fetch(
 	}
 	if err != nil {
 		dlog.Debugf("[%s]: [%s]", req.URL, err)
-		return nil, statusCode, nil, rtt, err
+		return nil, statusCode, nil, rtt, ft, err
 	}
 	if xTransport.h3Transport != nil && !hasAltSupport {
 		// In probe mode nothing rewrites the entry between the negative-cache read
@@ -885,28 +946,32 @@ func (xTransport *XTransport) Fetch(
 		}
 	}
 	tls := resp.TLS
+	if tls != nil {
+		ft.TLSResumed = tls.DidResume
+		ft.NegotiatedProto = tls.NegotiatedProtocol
+	}
 
 	var bodyReader io.ReadCloser = resp.Body
 	if compress && resp.Header.Get("Content-Encoding") == "gzip" {
 		bodyReader, err = gzip.NewReader(io.LimitReader(resp.Body, MaxHTTPBodyLength))
 		if err != nil {
-			return nil, statusCode, tls, rtt, err
+			return nil, statusCode, tls, rtt, ft, err
 		}
 		defer bodyReader.Close()
 	}
 
 	bin, err := io.ReadAll(io.LimitReader(bodyReader, MaxHTTPBodyLength))
 	if err != nil {
-		return nil, statusCode, tls, rtt, err
+		return nil, statusCode, tls, rtt, ft, err
 	}
-	return bin, statusCode, tls, rtt, err
+	return bin, statusCode, tls, rtt, ft, err
 }
 
 func (xTransport *XTransport) GetWithCompression(
 	url *url.URL,
 	accept string,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	return xTransport.Fetch("GET", url, accept, "", nil, timeout, true)
 }
 
@@ -914,7 +979,7 @@ func (xTransport *XTransport) Get(
 	url *url.URL,
 	accept string,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	return xTransport.Fetch("GET", url, accept, "", nil, timeout, false)
 }
 
@@ -924,7 +989,7 @@ func (xTransport *XTransport) Post(
 	contentType string,
 	body *[]byte,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	return xTransport.Fetch("POST", url, accept, contentType, body, timeout, false)
 }
 
@@ -934,7 +999,7 @@ func (xTransport *XTransport) dohLikeQuery(
 	url *url.URL,
 	body []byte,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	if useGet {
 		qs := url.Query()
 		encBody := base64.RawURLEncoding.EncodeToString(body)
@@ -951,7 +1016,7 @@ func (xTransport *XTransport) DoHQuery(
 	url *url.URL,
 	body []byte,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	return xTransport.dohLikeQuery("application/dns-message", useGet, url, body, timeout)
 }
 
@@ -960,6 +1025,6 @@ func (xTransport *XTransport) ObliviousDoHQuery(
 	url *url.URL,
 	body []byte,
 	timeout time.Duration,
-) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+) ([]byte, int, *tls.ConnectionState, time.Duration, *FetchTrace, error) {
 	return xTransport.dohLikeQuery("application/oblivious-dns-message", useGet, url, body, timeout)
 }

@@ -21,6 +21,25 @@ func validateQuery(query []byte) bool {
 	return true
 }
 
+// applyHTTPFetchTrace records transport-layer observations of an HTTP-based
+// exchange (DoH/ODoH) on the plugin state. ODoH keeps its own transport
+// classification while still inheriting fallback/connection-reuse signals.
+func applyHTTPFetchTrace(pluginsState *PluginsState, ft *FetchTrace, odoh bool) {
+	if ft == nil {
+		return
+	}
+	pluginsState.exchange.QUICFallback = ft.QUICFallback
+	pluginsState.exchange.ConnReused = ft.ConnReused
+	switch {
+	case odoh:
+		pluginsState.exchange.Transport = TransportODoH
+	case ft.UsedHTTP3 || ft.NegotiatedProto == "h3":
+		pluginsState.exchange.Transport = TransportDoHH3
+	default:
+		pluginsState.exchange.Transport = TransportDoHH2
+	}
+}
+
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
 	if err := validateResponseForQuery(pluginsState.questionMsg, synth); err != nil {
@@ -57,28 +76,36 @@ func processDNSCryptQuery(
 
 	serverInfo.noticeBegin(proxy)
 	var response []byte
+	pluginsState.exchange.Transport = TransportDNSCryptUDP
 
 	if serverProto == "udp" {
-		response, err = proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+		var connReused bool
+		response, connReused, err = proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+		pluginsState.exchange.ConnReused = connReused
 		retryOverTCP := false
 		if err == nil && len(response) >= MinDNSPacketSize && response[2]&0x02 == 0x02 {
+			pluginsState.exchange.UpstreamTruncated = true
 			retryOverTCP = true
 		} else if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			dlog.Debugf("[%v] Retry over TCP after UDP timeouts", serverInfo.Name)
 			retryOverTCP = true
 		}
 		if retryOverTCP {
+			pluginsState.exchange.TCPFallback = true
 			serverProto = "tcp"
 			sharedKey, encryptedQuery, clientNonce, queryEpoch, err = proxy.Encrypt(serverInfo, query, serverProto)
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				serverInfo.noticeFailure(proxy)
 				return nil, err
 			}
+			pluginsState.exchange.Transport = TransportDNSCryptTCP
+			pluginsState.exchange.ConnReused = false
 			response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 		}
 	} else {
+		pluginsState.exchange.Transport = TransportDNSCryptTCP
+		pluginsState.exchange.ConnReused = false
 		response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 	}
 
@@ -92,7 +119,6 @@ func processDNSCryptQuery(
 			}
 		}
 		// No stale response available; this is a definitive failure
-		serverInfo.noticeFailure(proxy)
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
@@ -115,8 +141,9 @@ func processDoHQuery(
 	tid := TransactionID(query)
 	SetTransactionID(query, 0)
 	serverInfo.noticeBegin(proxy)
-	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
+	serverResponse, _, tls, _, fetchTrace, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
 	SetTransactionID(query, tid)
+	applyHTTPFetchTrace(pluginsState, fetchTrace, false)
 
 	// A response was received, and the TLS handshake was complete.
 	if err == nil && tls != nil && tls.HandshakeComplete {
@@ -138,7 +165,6 @@ func processDoHQuery(
 	}
 
 	// No stale response available; this is a definitive failure
-	serverInfo.noticeFailure(proxy)
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	return nil, err
@@ -158,7 +184,6 @@ func refreshODoHKey(proxy *Proxy, serverInfo *ServerInfo, stamp stamps.ServerSta
 	dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
 	if err := proxy.serversInfo.refreshServer(proxy, serverInfo.Name, stamp); err != nil {
 		dlog.Noticef("Key update failed for [%v]", serverInfo.Name)
-		serverInfo.noticeFailure(proxy)
 		return err
 	}
 	success = true
@@ -191,15 +216,15 @@ func processODoHQuery(
 		targetURL = serverInfo.Relay.ODoH.URL
 	}
 
-	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
+	responseBody, responseCode, _, _, fetchTrace, err := proxy.xTransport.ObliviousDoHQuery(
 		serverInfo.useGet, targetURL, odohQuery.odohMessage, proxy.timeout,
 	)
+	applyHTTPFetchTrace(pluginsState, fetchTrace, true)
 
 	if err == nil && len(responseBody) > 0 && responseCode == 200 {
 		response, err := odohQuery.decryptResponse(responseBody)
 		if err != nil {
 			dlog.Warnf("Failed to decrypt response from [%v]", serverInfo.Name)
-			serverInfo.noticeFailure(proxy)
 			return nil, err
 		}
 
@@ -260,7 +285,6 @@ func processODoHQuery(
 
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-	serverInfo.noticeFailure(proxy)
 
 	return nil, err
 }
@@ -275,6 +299,9 @@ func handleDNSExchange(
 ) ([]byte, error) {
 	var err error
 	var response []byte
+
+	// Anchor exchange timing for the unified feedback path.
+	pluginsState.exchangeStart = time.Now()
 
 	if serverInfo.Proto == stamps.StampProtoTypeDNSCrypt {
 		response, err = processDNSCryptQuery(proxy, serverInfo, pluginsState, query, serverProto)
@@ -293,7 +320,6 @@ func handleDNSExchange(
 	if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		serverInfo.noticeFailure(proxy)
 		return nil, err
 	}
 
@@ -314,7 +340,6 @@ func processPlugins(
 	if err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		serverInfo.noticeFailure(proxy)
 		return response, err
 	}
 
@@ -332,16 +357,14 @@ func processPlugins(
 		}
 	}
 
-	// Check rcode and handle failures
+	// RCODE/DNSSEC quality signals are derived by the unified feedback
+	// path (ServersInfo.observeOutcome) once processing is complete.
 	if rcode := Rcode(response); rcode == dns.RcodeServerFailure { // SERVFAIL
 		if pluginsState.dnssec {
 			dlog.Debug("A response had an invalid DNSSEC signature")
 		} else {
 			dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
-			serverInfo.noticeFailure(proxy)
 		}
-	} else {
-		serverInfo.noticeSuccess(proxy)
 	}
 
 	return response, nil
@@ -375,6 +398,7 @@ func sendResponse(
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 				return
 			}
+			pluginsState.exchange.LocalTruncated = true
 		}
 		clientPc.(net.PacketConn).WriteTo(response, *clientAddr)
 		if HasTCFlag(response) {

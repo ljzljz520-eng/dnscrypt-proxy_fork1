@@ -91,7 +91,9 @@ func (p *UDPConnPool) cleanupStale() {
 	}
 }
 
-func (p *UDPConnPool) Get(addr *net.UDPAddr) (*net.UDPConn, error) {
+// Get returns a UDP connection for addr and reports whether it was reused
+// from the pool (true) or freshly dialed (false).
+func (p *UDPConnPool) Get(addr *net.UDPAddr) (*net.UDPConn, bool, error) {
 	addrStr := addr.String()
 	shard := p.getShard(addrStr)
 
@@ -103,11 +105,12 @@ func (p *UDPConnPool) Get(addr *net.UDPAddr) (*net.UDPConn, error) {
 		shard.Unlock()
 		pc.conn.SetReadDeadline(time.Time{})
 		pc.conn.SetWriteDeadline(time.Time{})
-		return pc.conn, nil
+		return pc.conn, true, nil
 	}
 	shard.Unlock()
 
-	return net.DialUDP("udp", nil, addr)
+	pc, err := net.DialUDP("udp", nil, addr)
+	return pc, false, err
 }
 
 func (p *UDPConnPool) Put(addr *net.UDPAddr, conn *net.UDPConn) {

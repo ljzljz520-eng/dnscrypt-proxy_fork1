@@ -91,6 +91,12 @@ type PluginsState struct {
 	cacheMinTTL                      uint32
 	cacheHit                         bool
 	dnssec                           bool
+	// exchange accumulates multi-dimensional observations about the
+	// current upstream exchange; it is filled while the query is served
+	// and consumed by ServersInfo.observeOutcome once the response is
+	// post-processed.
+	exchange      ExchangeOutcome
+	exchangeStart time.Time
 }
 
 func (proxy *Proxy) InitPluginsGlobals() error {

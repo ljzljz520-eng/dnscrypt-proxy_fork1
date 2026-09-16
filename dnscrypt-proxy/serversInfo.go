@@ -68,11 +68,40 @@ type ServerInfo struct {
 	useGet             bool
 	odohTargetConfigs  []ODoHTargetConfig
 
+	// Props retains the informal stamp properties (DNSSEC/NoLog/NoFilter) so
+	// that schedulers can use them as a soft preference and observability
+	// surfaces can display resolver characteristics.
+	Props stamps.ServerInformalProperties
+
 	// WP2 strategy fields
 	totalQueries   uint64    // Total queries sent to this server
 	failedQueries  uint64    // Failed queries count
 	lastUpdateTime time.Time // Last time metrics were updated
 	lastDecayTS    time.Time // Last time RTT was decayed for recovery
+}
+
+// SupportsDNSSEC reports whether the resolver stamp claims DNSSEC support.
+func (serverInfo *ServerInfo) SupportsDNSSEC() bool {
+	return serverInfo.Props&stamps.ServerInformalPropertyDNSSEC != 0
+}
+
+// SupportsNoLog reports whether the resolver stamp claims the no-log property.
+func (serverInfo *ServerInfo) SupportsNoLog() bool {
+	return serverInfo.Props&stamps.ServerInformalPropertyNoLog != 0
+}
+
+// SupportsNoFilter reports whether the resolver stamp claims the no-filter
+// property.
+func (serverInfo *ServerInfo) SupportsNoFilter() bool {
+	return serverInfo.Props&stamps.ServerInformalPropertyNoFilter != 0
+}
+
+// ResolverCandidate pairs a live server with the metric store that
+// accumulates its observations. It is the read-only view consumed by
+// schedulers while serversInfo is locked.
+type ResolverCandidate struct {
+	Server  *ServerInfo
+	Metrics *ResolverMetrics
 }
 
 type LBStrategy interface {
@@ -170,9 +199,14 @@ type ServersInfo struct {
 	registeredRelays    []RegisteredServer
 	lbStrategy          LBStrategy
 	lbEstimator         bool
+	metrics             map[string]*ResolverMetrics
+	metricsWindow       time.Duration
 	odohRefreshMu       sync.Mutex
 	odohRefreshInFlight map[string]bool
 	odohLastFailureAt   map[string]time.Time
+	// now is the clock used for feedback timing; it is overridable in
+	// tests.
+	now func() time.Time
 }
 
 func NewServersInfo() ServersInfo {
@@ -181,9 +215,64 @@ func NewServersInfo() ServersInfo {
 		lbEstimator:         true,
 		registeredServers:   make([]RegisteredServer, 0),
 		registeredRelays:    make([]RegisteredServer, 0),
+		metrics:             make(map[string]*ResolverMetrics),
+		metricsWindow:       metricsWindow,
 		odohRefreshInFlight: make(map[string]bool),
 		odohLastFailureAt:   make(map[string]time.Time),
+		now:                 time.Now,
 	}
+}
+
+// metricsForLocked returns the metric store bound to a resolver name,
+// creating it on first use. Keying by name (rather than by ServerInfo
+// pointer) makes the metrics survive certificate refreshes, which replace
+// the ServerInfo object. Callers must hold serversInfo's lock.
+func (serversInfo *ServersInfo) metricsForLocked(name string) *ResolverMetrics {
+	m := serversInfo.metrics[name]
+	if m == nil {
+		m = NewResolverMetricsWithWindow(serversInfo.metricsWindow)
+		if serversInfo.now != nil {
+			m.now = serversInfo.now
+		}
+		serversInfo.metrics[name] = m
+	}
+	return m
+}
+
+// MetricsFor returns the metric store for a resolver name, creating it if
+// needed.
+func (serversInfo *ServersInfo) MetricsFor(name string) *ResolverMetrics {
+	serversInfo.Lock()
+	defer serversInfo.Unlock()
+	return serversInfo.metricsForLocked(name)
+}
+
+// candidatesLocked pairs every live server with its metric store. It is
+// safe to call with either the read or the write lock held: it never
+// mutates the metrics map (stores are pre-registered by refreshServer
+// under the write lock). A resolver without a published store only exists
+// in test harnesses that append to inner directly; such candidates get a
+// throwaway empty store rather than triggering a map write, so concurrent
+// RLock scrapers can never race a map insertion.
+func (serversInfo *ServersInfo) candidatesLocked() []ResolverCandidate {
+	candidates := make([]ResolverCandidate, 0, len(serversInfo.inner))
+	for _, server := range serversInfo.inner {
+		if server == nil {
+			continue
+		}
+		m := serversInfo.metrics[server.Name]
+		if m == nil {
+			m = NewResolverMetricsWithWindow(serversInfo.metricsWindow)
+			if serversInfo.now != nil {
+				m.now = serversInfo.now
+			}
+		}
+		candidates = append(candidates, ResolverCandidate{
+			Server:  server,
+			Metrics: m,
+		})
+	}
+	return candidates
 }
 
 // beginODoHRefresh returns true if the caller should perform an ODoH key
@@ -302,6 +391,10 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	if !found {
 		serversInfo.inner = append(serversInfo.inner, &newServer)
 	}
+	// Pre-publish the metric store before the server becomes visible to
+	// RLock-only scrapers, so candidatesLocked never has to lazily insert
+	// into the map under a read lock.
+	serversInfo.metricsForLocked(name)
 	serversInfo.Unlock()
 	proxy.cryptoKeyMu.RUnlock()
 	if !found {
@@ -460,8 +553,22 @@ func (serversInfo *ServersInfo) getOne() *ServerInfo {
 
 	var candidate int
 
-	// Check if using WP2 strategy
-	if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 {
+	// Stateful strategies that consume the full metric/property view
+	// implement lbStrategyAdvanced. The returned index addresses the
+	// paired candidate snapshot, whose order matches inner; it is mapped
+	// back by name to stay robust against nil entries.
+	if advanced, isAdvanced := serversInfo.lbStrategy.(lbStrategyAdvanced); isAdvanced {
+		candidates := serversInfo.candidatesLocked()
+		picked := advanced.selectCandidateLocked(candidates)
+		pickedName := candidates[picked].Server.Name
+		for i, server := range serversInfo.inner {
+			if server.Name == pickedName {
+				candidate = i
+				break
+			}
+		}
+	} else if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 {
+		// Check if using WP2 strategy
 		candidate = serversInfo.getWeightedCandidate(serversCount)
 	} else {
 		candidate = serversInfo.lbStrategy.getCandidate(serversCount)
@@ -540,51 +647,6 @@ func (serversInfo *ServersInfo) calculateServerScore(server *ServerInfo) float64
 	finalScore := (rttScore * 0.7) + (successRate * 0.3)
 
 	return finalScore
-}
-
-// updateServerStats updates server statistics after each query
-func (serversInfo *ServersInfo) updateServerStats(serverName string, success bool) {
-	serversInfo.Lock()
-	defer serversInfo.Unlock()
-
-	for _, server := range serversInfo.inner {
-		if server.Name == serverName {
-			server.totalQueries++
-			if !success {
-				server.failedQueries++
-			}
-			server.lastUpdateTime = time.Now()
-
-			// Reset counters periodically to prevent overflow and adapt to changes
-			if server.totalQueries > 10000 {
-				server.totalQueries = server.totalQueries / 2
-				server.failedQueries = server.failedQueries / 2
-			}
-			break
-		}
-	}
-}
-
-// logWP2Stats logs WP2 performance statistics for debugging
-func (serversInfo *ServersInfo) logWP2Stats() {
-	if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); !isWP2 {
-		return
-	}
-
-	serversInfo.RLock()
-	defer serversInfo.RUnlock()
-
-	dlog.Debug("WP2 Strategy Server Statistics:")
-	for i, server := range serversInfo.inner {
-		score := serversInfo.calculateServerScore(server)
-		successRate := 1.0
-		if server.totalQueries > 0 {
-			successRate = float64(server.totalQueries-server.failedQueries) / float64(server.totalQueries)
-		}
-
-		dlog.Debugf("[%d] %s: RTT=%dms, Score=%.3f, Success=%.2f%%, Queries=%d",
-			i, server.Name, int(server.rtt.Value()), score, successRate*100, server.totalQueries)
-	}
 }
 
 func fetchServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
@@ -922,6 +984,7 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 		Relay:              relay,
 		initialRtt:         rtt,
 		knownBugs:          knownBugs,
+		Props:              stamp.Props,
 	}, nil
 }
 
@@ -993,15 +1056,15 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	}
 	body := dohTestPacket(0xcafe).Data
 	useGet := false
-	if _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
+	if _, _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
 		useGet = true
-		if _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
+		if _, _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
 			return ServerInfo{}, err
 		}
 		dlog.Debugf("Server [%s] doesn't appear to support POST; falling back to GET requests", name)
 	}
 	queryMsg := dohNXTestPacket(0xcafe)
-	serverResponse, _, tls, rtt, err := proxy.xTransport.DoHQuery(useGet, url, queryMsg.Data, proxy.timeout)
+	serverResponse, _, tls, rtt, _, err := proxy.xTransport.DoHQuery(useGet, url, queryMsg.Data, proxy.timeout)
 	if err != nil {
 		dlog.Infof("[%s] [%s]: %v", name, url, err)
 		return ServerInfo{}, err
@@ -1074,11 +1137,12 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		HostName:   stamp.ProviderName,
 		initialRtt: xrtt,
 		useGet:     useGet,
+		Props:      stamp.Props,
 	}, nil
 }
 
 func fetchTargetConfigsFromWellKnown(proxy *Proxy, url *url.URL) ([]ODoHTargetConfig, error) {
-	bin, statusCode, _, _, err := proxy.xTransport.Get(url, "application/binary", 0)
+	bin, statusCode, _, _, _, err := proxy.xTransport.Get(url, "application/binary", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1143,10 +1207,10 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 		}
 
 		useGet := false
-		_, postStatusCode, _, _, postErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
+		_, postStatusCode, _, _, _, postErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
 		if postErr != nil {
 			useGet = true
-			_, getStatusCode, _, _, getErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
+			_, getStatusCode, _, _, _, getErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
 			if getErr != nil {
 				lastProbeErr = fmt.Errorf(
 					"ODoH relay probe via POST and GET failed: POST HTTP status %d: %w; GET HTTP status %d: %w",
@@ -1167,7 +1231,7 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 			continue
 		}
 
-		responseBody, responseCode, tls, rtt, err := proxy.xTransport.ObliviousDoHQuery(
+		responseBody, responseCode, tls, rtt, _, err := proxy.xTransport.ObliviousDoHQuery(
 			useGet,
 			url,
 			odohQuery.odohMessage,
@@ -1275,6 +1339,7 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 			useGet:            useGet,
 			Relay:             relay,
 			odohTargetConfigs: workingConfigs,
+			Props:             stamp.Props,
 		}, nil
 	}
 	if lastProbeErr != nil {
@@ -1298,25 +1363,11 @@ func fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, is
 	return serverInfo, err
 }
 
-func (serverInfo *ServerInfo) noticeFailure(proxy *Proxy) {
-	proxy.serversInfo.Lock()
-	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
-	proxy.serversInfo.Unlock()
-}
-
+// noticeBegin marks activity on the server for dormant-server recovery
+// throttling. RTT/counter feedback is centralized in
+// ServersInfo.observeOutcome.
 func (serverInfo *ServerInfo) noticeBegin(proxy *Proxy) {
 	proxy.serversInfo.Lock()
 	serverInfo.lastActionTS = time.Now()
-	proxy.serversInfo.Unlock()
-}
-
-func (serverInfo *ServerInfo) noticeSuccess(proxy *Proxy) {
-	now := time.Now()
-	proxy.serversInfo.Lock()
-	elapsed := now.Sub(serverInfo.lastActionTS)
-	elapsedMs := elapsed.Nanoseconds() / 1000000
-	if elapsedMs > 0 && elapsed < proxy.timeout {
-		serverInfo.rtt.Add(float64(elapsedMs))
-	}
 	proxy.serversInfo.Unlock()
 }

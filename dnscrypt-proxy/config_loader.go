@@ -217,6 +217,11 @@ func configureLoadBalancing(proxy *Proxy, config *Config) {
 		lbStrategy = LBStrategyRandom{}
 	case "wp2":
 		lbStrategy = LBStrategyWP2{}
+	case "mds":
+		params, metricsWindowCfg := applyMDSConfig(config.SchedulerMDS)
+		lbStrategy = NewLBStrategyMDS(params)
+		proxy.serversInfo.metricsWindow = metricsWindowCfg
+		dlog.Noticef("Using multi-dimensional scheduler (MDS) load balancing strategy")
 	default:
 		if after, ok := strings.CutPrefix(lbStrategyStr, "p"); ok {
 			n, err := strconv.ParseInt(after, 10, 32)
@@ -231,6 +236,92 @@ func configureLoadBalancing(proxy *Proxy, config *Config) {
 	}
 	proxy.serversInfo.lbStrategy = lbStrategy
 	proxy.serversInfo.lbEstimator = config.LBEstimator
+}
+
+// applyMDSConfig validates the optional [scheduler_mds] section and turns
+// it into MDSParams plus the metric sliding-window length. Any absent key
+// keeps the default; an out-of-range key is reported with a warning and
+// replaced by the default as well.
+func applyMDSConfig(cfg MDSSchedulerConfig) (MDSParams, time.Duration) {
+	params := DefaultMDSParams()
+	window := metricsWindow
+
+	warn := func(key string, value any) {
+		dlog.Warnf("[scheduler_mds] %s value %v is out of range; using default", key, value)
+	}
+	floatInRange := func(p *float64, key string, lo, hi float64, dst *float64) {
+		if p == nil {
+			return
+		}
+		if *p < lo || *p > hi {
+			warn(key, *p)
+			return
+		}
+		*dst = *p
+	}
+	durationInRange := func(p *string, key string, lo, hi time.Duration, dst *time.Duration) {
+		if p == nil {
+			return
+		}
+		d, err := time.ParseDuration(*p)
+		if err != nil || d < lo || d > hi {
+			warn(key, *p)
+			return
+		}
+		*dst = d
+	}
+
+	if cfg.WarmupSamples != nil {
+		if *cfg.WarmupSamples < 1 || *cfg.WarmupSamples > 10000 {
+			warn("warmup_samples", *cfg.WarmupSamples)
+		} else {
+			params.WarmupSamples = *cfg.WarmupSamples
+		}
+	}
+	if cfg.PenaltyMinSamples != nil {
+		if *cfg.PenaltyMinSamples < 1 || *cfg.PenaltyMinSamples > 10000 {
+			warn("penalty_min_samples", *cfg.PenaltyMinSamples)
+		} else {
+			params.PenaltyMinSamples = *cfg.PenaltyMinSamples
+		}
+	}
+	if params.PenaltyMinSamples > params.WarmupSamples {
+		dlog.Warnf("[scheduler_mds] penalty_min_samples (%d) cannot exceed warmup_samples (%d); using defaults",
+			params.PenaltyMinSamples, params.WarmupSamples)
+		params.WarmupSamples = DefaultMDSParams().WarmupSamples
+		params.PenaltyMinSamples = DefaultMDSParams().PenaltyMinSamples
+	}
+
+	floatInRange(cfg.SwitchMargin, "switch_margin", 0, 1, &params.SwitchMargin)
+	floatInRange(cfg.TieBand, "tie_band", 0, 0.5, &params.TieBand)
+	if params.TieBand > params.SwitchMargin {
+		dlog.Warnf("[scheduler_mds] tie_band (%g) cannot exceed switch_margin (%g); using defaults",
+			params.TieBand, params.SwitchMargin)
+		params.SwitchMargin = DefaultMDSParams().SwitchMargin
+		params.TieBand = DefaultMDSParams().TieBand
+	}
+	durationInRange((*string)(cfg.Dwell), "dwell", 0, time.Hour, &params.Dwell)
+	floatInRange(cfg.ExplorationProbability, "exploration_probability", 0, 1, &params.ExploreProb)
+	if cfg.CircuitBreakerThreshold != nil {
+		if *cfg.CircuitBreakerThreshold < 1 || *cfg.CircuitBreakerThreshold > 100 {
+			warn("circuit_breaker_threshold", *cfg.CircuitBreakerThreshold)
+		} else {
+			params.BreakerThreshold = *cfg.CircuitBreakerThreshold
+		}
+	}
+	durationInRange(cfg.HalfOpenInterval, "half_open_interval", time.Second, time.Hour, &params.HalfOpenInterval)
+	durationInRange(cfg.MetricsWindow, "metrics_window", 30*time.Second, 30*time.Minute, &window)
+
+	floatInRange(cfg.WeightTimeout, "weight_timeout", 0, 10, &params.WeightTimeout)
+	floatInRange(cfg.WeightErrors, "weight_errors", 0, 10, &params.WeightErrors)
+	floatInRange(cfg.WeightServfail, "weight_servfail", 0, 10, &params.WeightServfail)
+	floatInRange(cfg.WeightDNSSECBogus, "weight_dnssec_bogus", 0, 10, &params.WeightBogus)
+	floatInRange(cfg.WeightTruncated, "weight_truncated", 0, 10, &params.WeightTruncated)
+	floatInRange(cfg.WeightFallback, "weight_fallback", 0, 10, &params.WeightFallback)
+	floatInRange(cfg.WeightConnNew, "weight_conn_new", 0, 10, &params.WeightConnNew)
+	floatInRange(cfg.WeightJitter, "weight_jitter", 0, 10, &params.WeightJitter)
+
+	return params, window
 }
 
 // configurePlugins - Configures DNS plugins

@@ -115,6 +115,7 @@ type resolverSnapshot struct {
 	status        string
 	score         float64
 	ageSeconds    float64
+	report        *ResolverReportRow
 }
 
 // MonitoringUI - Handles the monitoring UI
@@ -566,6 +567,9 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	}
 	mc.serverMutex.RUnlock()
 
+	// Add the multi-dimensional per-resolver scheduler metrics.
+	mc.appendResolverSchedulerMetrics(&result)
+
 	// Add query type metrics
 	mc.queryTypesMutex.RLock()
 	result.WriteString("# HELP dnscrypt_proxy_query_type_total Total queries per DNS record type\n")
@@ -646,18 +650,23 @@ func resolverStatusRank(status string) int {
 	}
 }
 
-func (mc *MetricsCollector) collectResolverSnapshots() ([]resolverSnapshot, map[string]resolverSnapshot) {
+func (mc *MetricsCollector) collectResolverSnapshots() ([]resolverSnapshot, map[string]resolverSnapshot, SchedulerReport) {
 	snapshots := make([]resolverSnapshot, 0)
 	index := make(map[string]resolverSnapshot)
 
 	if mc.proxy == nil {
-		return snapshots, index
+		return snapshots, index, SchedulerReport{}
 	}
 
 	mc.proxy.serversInfo.RLock()
 	defer mc.proxy.serversInfo.RUnlock()
 
 	now := time.Now()
+	report := mc.proxy.serversInfo.buildSchedulerReportLocked()
+	reportByName := make(map[string]*ResolverReportRow, len(report.Rows))
+	for i := range report.Rows {
+		reportByName[report.Rows[i].Name] = &report.Rows[i]
+	}
 	for _, server := range mc.proxy.serversInfo.inner {
 		if server == nil {
 			continue
@@ -694,6 +703,7 @@ func (mc *MetricsCollector) collectResolverSnapshots() ([]resolverSnapshot, map[
 			status:     status,
 			score:      score,
 			ageSeconds: ageSeconds,
+			report:     reportByName[server.Name],
 		}
 
 		snapshots = append(snapshots, snapshot)
@@ -710,7 +720,7 @@ func (mc *MetricsCollector) collectResolverSnapshots() ([]resolverSnapshot, map[
 		return snapshots[i].name < snapshots[j].name
 	})
 
-	return snapshots, index
+	return snapshots, index, report
 }
 
 func (mc *MetricsCollector) collectCacheStats(cacheHitRatio float64, cacheHits, cacheMisses uint64) map[string]any {
@@ -860,7 +870,7 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 	}
 
 	cacheStats := mc.collectCacheStats(cacheHitRatio, cacheHits, cacheMisses)
-	resolverSnapshots, resolverIndex := mc.collectResolverSnapshots()
+	resolverSnapshots, resolverIndex, schedulerReport := mc.collectResolverSnapshots()
 
 	// Update resolver snapshots with observed average response times.
 	mc.serverMutex.RLock()
@@ -986,6 +996,49 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		if !snapshot.lastAction.IsZero() {
 			entry["last_action"] = snapshot.lastAction
 		}
+		if r := snapshot.report; r != nil {
+			// Multi-dimensional scheduler view. Quantiles are omitted
+			// until enough samples exist; consumers degrade gracefully.
+			entry["window_samples"] = r.Samples
+			entry["lifetime_samples"] = r.TotalSamples
+			entry["warming"] = r.Warming
+			entry["latency_ewma_ms"] = r.LatencyEwmaMs
+			entry["jitter_ewma_ms"] = r.JitterEwmaMs
+			if r.HasP50 {
+				entry["p50_ms"] = r.P50Ms
+			}
+			if r.HasP95 {
+				entry["p95_ms"] = r.P95Ms
+			}
+			if r.HasP99 {
+				entry["p99_ms"] = r.P99Ms
+			}
+			entry["timeout_rate"] = r.TimeoutRate
+			entry["error_rate"] = r.ErrorRate
+			entry["servfail_rate"] = r.ServfailRate
+			entry["dnssec_bogus_rate"] = r.BogusRate
+			entry["truncated_rate"] = r.TruncatedRate
+			entry["tcp_fallback_rate"] = r.TCPFallbackRate
+			entry["quic_fallback_rate"] = r.QUICFallbackRate
+			entry["conn_new_rate"] = r.ConnNewRate
+			entry["ecs_scope_rate"] = r.ECSRate
+			entry["timeout_total"] = r.TimeoutCount
+			entry["servfail_total"] = r.ServfailCount
+			entry["dnssec_bogus_total"] = r.BogusCount
+			entry["truncated_total"] = r.TruncatedCount
+			entry["tcp_fallback_total"] = r.TCPFallbackCount
+			entry["quic_fallback_total"] = r.QUICFallbackCount
+			entry["conn_new_total"] = r.ConnNewCount
+			entry["conn_reused_total"] = r.ConnReusedCount
+			entry["ecs_returned_total"] = r.ECSCount
+			entry["feature_dnssec"] = r.DNSSEC
+			entry["feature_nolog"] = r.NoLog
+			entry["feature_nofilter"] = r.NoFilter
+			entry["primary"] = r.Primary
+			entry["circuit_open"] = r.CircuitOpen
+			entry["scheduler_score"] = r.Score
+			entry["switches_to"] = r.SwitchesTo
+		}
 		resolverHealth = append(resolverHealth, entry)
 	}
 
@@ -1007,8 +1060,14 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		"recent_queries":     recentQueries,
 		"cache_stats":        cacheStats,
 		"resolver_health":    resolverHealth,
-		"sources":            sourceRefresh,
-		"generated_at":       generatedAt,
+		"scheduler": map[string]any{
+			"strategy":       schedulerReport.Strategy,
+			"primary":        schedulerReport.PrimaryName,
+			"switches_total": schedulerReport.TotalSwitches,
+			"open_circuits":  schedulerReport.OpenCircuits,
+		},
+		"sources":      sourceRefresh,
+		"generated_at": generatedAt,
 	}
 
 	// Cache the computed metrics

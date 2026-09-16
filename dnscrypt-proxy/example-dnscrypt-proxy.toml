@@ -175,9 +175,16 @@ keepalive = 30
 #                        Load Balancing & Performance                          #
 ###############################################################################
 
-## Load-balancing strategy: 'wp2' (default), 'p2', 'ph', 'p<n>', 'first', or 'random'
+## Load-balancing strategy: 'wp2' (default), 'mds', 'p2', 'ph', 'p<n>', 'first', or 'random'
 ## 'wp2' (default): Weighted Power of Two - selects the better performing server
 ## from two random candidates based on real-time RTT and success rates.
+## 'mds': Multi-Dimensional Scheduler - sticky primary selected from a sliding
+## window of tail latency (p95), jitter, timeout/SERVFAIL/DNSSEC-bogus rates,
+## truncation, TCP/QUIC fallbacks and connection costs. It adds a cold-start
+## warmup (no premature eviction), anti-oscillation margins/dwell timers, and a
+## circuit breaker with half-open recovery. Resolver filtering/DNSSEC stamps and
+## ECS behavior are soft preferences, never hard exclusions. Tunables are in the
+## optional [scheduler_mds] section below.
 ## 'p2': Randomly choose 1 of the fastest 2 servers by latency.
 ## 'ph': Randomly choose from fastest half of servers.
 ## 'p<n>': Randomly choose from fastest n servers (e.g., 'p3' for fastest 3).
@@ -186,6 +193,41 @@ keepalive = 30
 ## The response quality still depends on the server itself.
 
 # lb_strategy = 'wp2'
+
+## Optional tuning for lb_strategy = 'mds'. Every key is optional; out-of-range
+## values are ignored with a warning and replaced by the default.
+# [scheduler_mds]
+# ## Lifetime samples below which a resolver is warming (no penalties, breaker
+# ## disabled, initial RTT probe used as prior). 1..10000.
+# warmup_samples = 20
+# ## Minimum in-window samples before ratio-based penalties apply. 1..10000 and
+# ## no larger than warmup_samples.
+# penalty_min_samples = 10
+# ## Minimum relative score improvement required to switch the sticky primary.
+# switch_margin = 0.15
+# ## Score gap below which soft preferences (NoFilter/DNSSEC/ECS) may decide.
+# tie_band = 0.03
+# ## Minimum time a primary is kept before a non-breaker switch (Go duration).
+# dwell = '5s'
+# ## Probability of an exploratory query (warming resolvers first). 0..1.
+# exploration_probability = 0.15
+# ## Consecutive timeouts/network errors that open a mature resolver's circuit.
+# circuit_breaker_threshold = 3
+# ## Wait between an open circuit and a half-open recovery probe.
+# half_open_interval = '10s'
+# ## Sliding metric window, 30s..30m (always split into 10 epochs).
+# ## Applied to resolvers first seen after the (re)load; existing
+# ## resolvers keep the window they were registered with.
+# metrics_window = '5m'
+# ## Additive quality-penalty weights (0 disables a dimension, up to 10).
+# weight_timeout = 0.5
+# weight_errors = 0.3
+# weight_servfail = 0.2
+# weight_dnssec_bogus = 0.5
+# weight_truncated = 0.05
+# weight_fallback = 0.1
+# weight_conn_new = 0.05
+# weight_jitter = 0.1
 
 ## Set to `true` to constantly try to estimate the latency of all the resolvers
 ## and adjust the load-balancing parameters accordingly, or to `false` to disable.

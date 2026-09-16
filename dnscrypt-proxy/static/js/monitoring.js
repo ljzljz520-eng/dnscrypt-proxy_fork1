@@ -170,20 +170,53 @@ function safeUpdateDashboard(data) {
                 );
             });
 
+            const dash = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+            const dashText = (value, formatter) => {
+                const v = dash(value);
+                return v === null ? '–' : formatter(v);
+            };
+
             sortedResolvers.forEach(resolver => {
                 const row = resolverTable.insertRow();
-                row.insertCell(0).textContent = resolver.name || 'Unknown';
-                row.insertCell(1).textContent = formatStatus(resolver.status);
+                const nameCell = row.insertCell(0);
+                nameCell.textContent = (resolver.primary ? '★ ' : '') + (resolver.name || 'Unknown');
+                if (resolver.circuit_open) {
+                    nameCell.style.color = '#d9534f';
+                }
+
+                row.insertCell(1).textContent = resolver.circuit_open
+                    ? 'circuit-open'
+                    : (resolver.warming ? 'warming' : formatStatus(resolver.status));
                 row.insertCell(2).textContent = formatPercent(resolver.success_rate);
                 row.insertCell(3).textContent = formatNumber(resolver.total_queries !== undefined ? resolver.total_queries : resolver.queries);
                 row.insertCell(4).textContent = formatNumber(resolver.failed_queries);
                 row.insertCell(5).textContent = formatMilliseconds(resolver.avg_response_ms);
-                row.insertCell(6).textContent = formatTimestamp(resolver.last_update);
+                row.insertCell(6).textContent = dashText(resolver.p95_ms, formatMilliseconds);
+                row.insertCell(7).textContent = dashText(resolver.timeout_rate, formatPercent);
+                row.insertCell(8).textContent = dashText(resolver.servfail_rate, formatPercent);
+                row.insertCell(9).textContent = dashText(resolver.truncated_rate, formatPercent);
+                const tcpFallbackCount = typeof resolver.tcp_fallback_total === 'number' ? resolver.tcp_fallback_total : 0;
+                const quicFallbackCount = typeof resolver.quic_fallback_total === 'number' ? resolver.quic_fallback_total : 0;
+                row.insertCell(10).textContent = (tcpFallbackCount + quicFallbackCount) > 0
+                    ? `TCP ${tcpFallbackCount} / QUIC ${quicFallbackCount}`
+                    : '–';
+                row.insertCell(11).textContent = dashText(resolver.jitter_ewma_ms, formatMilliseconds);
+
+                // Soft-feature badges; absence of a field degrades to '–'.
+                const features = [];
+                if (resolver.feature_dnssec === true) features.push('DNSSEC');
+                if (resolver.feature_nolog === true) features.push('NoLog');
+                if (resolver.feature_nofilter === true) features.push('NoFilter');
+                if (typeof resolver.ecs_scope_rate === 'number' && resolver.ecs_scope_rate > 0) features.push('ECS');
+                const featuresCell = row.insertCell(12);
+                featuresCell.textContent = features.length > 0 ? features.join(', ') : '–';
+
+                row.insertCell(13).textContent = formatTimestamp(resolver.last_update);
             });
         } else {
             const row = resolverTable.insertRow();
             const cell = row.insertCell(0);
-            cell.colSpan = 7;
+            cell.colSpan = 14;
             cell.textContent = 'No resolver data yet';
         }
 

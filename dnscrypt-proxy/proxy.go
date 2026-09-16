@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
 	"runtime"
@@ -331,7 +332,7 @@ func (proxy *Proxy) StartProxy() {
 
 			// Log WP2 statistics every 5 minutes if debug logging is enabled
 			if time.Since(lastLogTime) > 5*time.Minute {
-				proxy.serversInfo.logWP2Stats()
+				proxy.serversInfo.logSchedulerStats()
 				lastLogTime = time.Now()
 			}
 
@@ -600,13 +601,16 @@ func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte)
 	*encryptedQuery = relayedQuery
 }
 
+// exchangeWithUDPServer returns the response together with connReused,
+// which is true when the underlying UDP socket was taken from the
+// connection pool rather than freshly dialed.
 func (proxy *Proxy) exchangeWithUDPServer(
 	serverInfo *ServerInfo,
 	sharedKey *[32]byte,
 	encryptedQuery []byte,
 	clientNonce []byte,
 	queryEpoch uint64,
-) ([]byte, error) {
+) ([]byte, bool, error) {
 	upstreamAddr := serverInfo.UDPAddr
 	if serverInfo.Relay != nil && serverInfo.Relay.Dnscrypt != nil {
 		upstreamAddr = serverInfo.Relay.Dnscrypt.RelayUDPAddr
@@ -617,14 +621,14 @@ func (proxy *Proxy) exchangeWithUDPServer(
 		return proxy.exchangeWithUDPServerViaProxy(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch, upstreamAddr, proxyDialer)
 	}
 
-	pc, err := proxy.udpConnPool.Get(upstreamAddr)
+	pc, connReused, err := proxy.udpConnPool.Get(upstreamAddr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if err := pc.SetDeadline(time.Now().Add(serverInfo.Timeout)); err != nil {
 		proxy.udpConnPool.Discard(pc)
-		return nil, err
+		return nil, false, err
 	}
 
 	query := encryptedQuery
@@ -637,7 +641,7 @@ func (proxy *Proxy) exchangeWithUDPServer(
 	for tries := 2; tries > 0; tries-- {
 		if _, err := pc.Write(query); err != nil {
 			proxy.udpConnPool.Discard(pc)
-			return nil, err
+			return nil, false, err
 		}
 		length, err := pc.Read(encryptedResponse)
 		if err == nil {
@@ -651,12 +655,13 @@ func (proxy *Proxy) exchangeWithUDPServer(
 
 	if readErr != nil {
 		proxy.udpConnPool.Discard(pc)
-		return nil, readErr
+		return nil, false, readErr
 	}
 
 	proxy.udpConnPool.Put(upstreamAddr, pc)
 
-	return proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce, queryEpoch)
+	response, err := proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce, queryEpoch)
+	return response, connReused, err
 }
 
 func (proxy *Proxy) exchangeWithUDPServerViaProxy(
@@ -667,15 +672,15 @@ func (proxy *Proxy) exchangeWithUDPServerViaProxy(
 	queryEpoch uint64,
 	upstreamAddr *net.UDPAddr,
 	proxyDialer *netproxy.Dialer,
-) ([]byte, error) {
+) ([]byte, bool, error) {
 	pc, err := (*proxyDialer).Dial("udp", upstreamAddr.String())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer pc.Close()
 
 	if err := pc.SetDeadline(time.Now().Add(serverInfo.Timeout)); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if serverInfo.Relay != nil && serverInfo.Relay.Dnscrypt != nil {
 		proxy.prepareForRelay(serverInfo.UDPAddr.IP, serverInfo.UDPAddr.Port, &encryptedQuery)
@@ -684,7 +689,7 @@ func (proxy *Proxy) exchangeWithUDPServerViaProxy(
 	var readErr error
 	for tries := 2; tries > 0; tries-- {
 		if _, err := pc.Write(encryptedQuery); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		length, err := pc.Read(encryptedResponse)
 		if err == nil {
@@ -696,9 +701,10 @@ func (proxy *Proxy) exchangeWithUDPServerViaProxy(
 		dlog.Debugf("[%v] Retry on timeout", serverInfo.Name)
 	}
 	if readErr != nil {
-		return nil, readErr
+		return nil, false, readErr
 	}
-	return proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce, queryEpoch)
+	response, err := proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce, queryEpoch)
+	return response, false, err
 }
 
 func (proxy *Proxy) exchangeWithTCPServer(
@@ -801,7 +807,7 @@ func (proxy *Proxy) processIncomingQuery(
 	clientPc net.Conn,
 	start time.Time,
 	onlyCached bool,
-) []byte {
+) (response []byte) {
 	// Initialize metrics for this query
 	clientAddrStr := "unknown"
 	if clientAddr != nil {
@@ -810,7 +816,6 @@ func (proxy *Proxy) processIncomingQuery(
 	dlog.Debugf("Processing incoming query from %s", clientAddrStr)
 
 	// Validate the query
-	var response []byte
 	if !validateQuery(query) {
 		return response
 	}
@@ -820,6 +825,16 @@ func (proxy *Proxy) processIncomingQuery(
 
 	var serverInfo *ServerInfo
 	var serverName string = "-"
+	var queryErr error
+
+	// Single feedback chokepoint: observe exactly once per dispatched
+	// exchange, after response post-processing (rcode/DNSSEC/truncation
+	// are final at this point).
+	defer func() {
+		if serverInfo != nil && !pluginsState.exchangeStart.IsZero() {
+			proxy.serversInfo.observeOutcome(proxy, &pluginsState, response, queryErr)
+		}
+	}()
 
 	// Apply query plugins with lazy server selection
 	query, err := pluginsState.ApplyQueryPlugins(
@@ -892,11 +907,8 @@ func (proxy *Proxy) processIncomingQuery(
 
 			exchangeResponse, err := handleDNSExchange(proxy, serverInfo, &pluginsState, query, serverProto)
 
-			// Update server statistics for WP2 strategy
-			success := (err == nil && exchangeResponse != nil)
-			proxy.serversInfo.updateServerStats(serverName, success)
-
 			if err != nil || exchangeResponse == nil {
+				queryErr = err
 				return response
 			}
 
@@ -905,6 +917,7 @@ func (proxy *Proxy) processIncomingQuery(
 			// Process the response through plugins
 			processedResponse, err := processPlugins(proxy, &pluginsState, query, serverInfo, response)
 			if err != nil {
+				queryErr = err
 				return nil
 			}
 
@@ -920,9 +933,7 @@ func (proxy *Proxy) processIncomingQuery(
 			pluginsState.returnCode = PluginsReturnCodeParseError
 		}
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		if serverInfo != nil {
-			serverInfo.noticeFailure(proxy)
-		}
+		queryErr = errors.New("invalid response size")
 		return response
 	}
 
